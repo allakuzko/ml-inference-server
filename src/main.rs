@@ -7,6 +7,7 @@ use ort::{
 use serde::{Deserialize, Serialize};
 use tokenizers::Tokenizer;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use tracing::info;
 
 #[derive(Deserialize)]
@@ -14,11 +15,23 @@ struct InferenceRequest {
     text: String,
 }
 
+#[derive(Deserialize)]
+struct BatchInferenceRequest {
+    texts: Vec<String>,
+}
+
 #[derive(Serialize)]
 struct InferenceResponse {
     text: String,
     label: String,
     score: f32,
+    inference_ms: u128,
+}
+
+#[derive(Serialize)]
+struct BatchInferenceResponse {
+    results: Vec<InferenceResponse>,
+    total_ms: u128,
 }
 
 #[derive(Serialize)]
@@ -54,6 +67,7 @@ async fn main() {
 
     let app = Router::new()
         .route("/predict", post(predict))
+        .route("/predict/batch", post(predict_batch))
         .route("/health", get(health))
         .with_state(state);
 
@@ -71,15 +85,12 @@ async fn health() -> Json<HealthResponse> {
     })
 }
 
-async fn predict(
-    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
-    Json(payload): Json<InferenceRequest>,
-) -> Json<InferenceResponse> {
-    let encoding = state
-        .tokenizer
-        .encode(payload.text.clone(), true)
-        .unwrap();
-
+fn run_inference(
+    session: &mut Session,
+    tokenizer: &Tokenizer,
+    text: &str,
+) -> InferenceResponse {
+    let encoding = tokenizer.encode(text, true).unwrap();
     let len = encoding.get_ids().len();
 
     let ids: Vec<i64> = encoding.get_ids().iter().map(|x| *x as i64).collect();
@@ -88,7 +99,7 @@ async fn predict(
     let input_ids = Tensor::<i64>::from_array(([1, len], ids)).unwrap();
     let attention_mask = Tensor::<i64>::from_array(([1, len], mask)).unwrap();
 
-    let mut session = state.session.lock().unwrap();
+    let start = Instant::now();
 
     let outputs = session
         .run(inputs![
@@ -96,6 +107,8 @@ async fn predict(
             "attention_mask" => attention_mask
         ])
         .unwrap();
+
+    let inference_ms = start.elapsed().as_millis();
 
     let (_, logits_data) = outputs["logits"]
         .try_extract_tensor::<f32>()
@@ -107,9 +120,51 @@ async fn predict(
     let label = if pos > neg { "POSITIVE" } else { "NEGATIVE" };
     let score = if pos > neg { pos } else { neg };
 
-    Json(InferenceResponse {
-        text: payload.text,
+    InferenceResponse {
+        text: text.to_string(),
         label: label.to_string(),
         score,
-    })
+        inference_ms,
+    }
+}
+
+async fn predict(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    Json(payload): Json<InferenceRequest>,
+) -> Json<InferenceResponse> {
+    let mut session = state.session.lock().unwrap();
+    let result = run_inference(&mut session, &state.tokenizer, &payload.text);
+
+    info!(
+        text = %result.text,
+        label = %result.label,
+        score = %result.score,
+        inference_ms = %result.inference_ms,
+        "predict"
+    );
+
+    Json(result)
+}
+
+async fn predict_batch(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    Json(payload): Json<BatchInferenceRequest>,
+) -> Json<BatchInferenceResponse> {
+    let total_start = Instant::now();
+    let mut session = state.session.lock().unwrap();
+
+    let results: Vec<InferenceResponse> = payload.texts
+        .iter()
+        .map(|text| run_inference(&mut session, &state.tokenizer, text))
+        .collect();
+
+    let total_ms = total_start.elapsed().as_millis();
+
+    info!(
+        count = %results.len(),
+        total_ms = %total_ms,
+        "predict_batch"
+    );
+
+    Json(BatchInferenceResponse { results, total_ms })
 }
