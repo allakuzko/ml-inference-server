@@ -13,4 +13,5 @@ serde_json = "1"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 anyhow = "1.0.102"
+tower_governor = "0.8.0"
 

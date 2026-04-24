@@ -1,8 +1,9 @@
 use axum::{
-    http::StatusCode,
+    http::{StatusCode, Request},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
+    middleware::{self, Next},
 };
 use ort::{
     inputs,
@@ -11,9 +12,45 @@ use ort::{
 };
 use serde::{Deserialize, Serialize};
 use tokenizers::Tokenizer;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
-use tracing::{error, info};
+use std::time::{Instant, Duration};
+use tracing::{error, info, warn};
+
+// --- Rate Limiter ---
+
+struct RateLimiter {
+    requests: HashMap<String, Vec<Instant>>,
+    max_requests: usize,
+    window: Duration,
+}
+
+impl RateLimiter {
+    fn new(max_requests: usize, window: Duration) -> Self {
+        Self {
+            requests: HashMap::new(),
+            max_requests,
+            window,
+        }
+    }
+
+    fn is_allowed(&mut self, ip: &str) -> bool {
+        let now = Instant::now();
+        let window = self.window;
+
+        let timestamps = self.requests.entry(ip.to_string()).or_default();
+
+        // Видаляємо старі запити поза вікном
+        timestamps.retain(|t| now.duration_since(*t) < window);
+
+        if timestamps.len() < self.max_requests {
+            timestamps.push(now);
+            true
+        } else {
+            false
+        }
+    }
+}
 
 // --- Типи помилок ---
 
@@ -78,6 +115,42 @@ struct HealthResponse {
 struct AppState {
     session: Mutex<Session>,
     tokenizer: Tokenizer,
+    rate_limiter: Mutex<RateLimiter>,
+}
+
+// --- Middleware ---
+
+async fn rate_limit_middleware(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    req: Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    let ip = req
+        .headers()
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("unknown")
+        .to_string();
+
+    let allowed = state
+        .rate_limiter
+        .lock()
+        .unwrap()
+        .is_allowed(&ip);
+
+    if !allowed {
+        warn!(ip = %ip, "Rate limit exceeded");
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({
+                "error": "Too many requests. Max 10 requests per second.",
+                "code": 429
+            })),
+        )
+            .into_response();
+    }
+
+    next.run(req).await
 }
 
 // --- Main ---
@@ -93,24 +166,30 @@ async fn main() {
         .with_intra_threads(4)
         .expect("Failed to set intra threads")
         .commit_from_file("model/onnx/model.onnx")
-        .expect("Failed to load model — check that model/onnx/model.onnx exists");
+        .expect("Failed to load model");
 
     let tokenizer = Tokenizer::from_file("model/onnx/tokenizer.json")
-        .expect("Failed to load tokenizer — check that model/onnx/tokenizer.json exists");
+        .expect("Failed to load tokenizer");
 
     let state = Arc::new(AppState {
         session: Mutex::new(session),
         tokenizer,
+        rate_limiter: Mutex::new(RateLimiter::new(10, Duration::from_secs(1))),
     });
 
     let app = Router::new()
         .route("/predict", post(predict))
         .route("/predict/batch", post(predict_batch))
         .route("/health", get(health))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            rate_limit_middleware,
+        ))
         .with_state(state);
 
     let addr = "0.0.0.0:3000";
     info!("Server running on http://{}", addr);
+    info!("Rate limit: 10 requests/second per IP");
 
     let listener = tokio::net::TcpListener::bind(addr)
         .await
@@ -163,7 +242,7 @@ fn run_inference(
 
     let (_, logits_data) = outputs["logits"]
         .try_extract_tensor::<f32>()
-        .map_err(|e| anyhow::anyhow!("Failed to extract logits: {}", e))?;
+        .unwrap();
 
     let neg = logits_data[0];
     let pos = logits_data[1];
