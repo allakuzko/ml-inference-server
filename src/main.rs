@@ -1,4 +1,4 @@
-use axum::{routing::post, Json, Router};
+use axum::{routing::{post, get}, Json, Router};
 use ort::{
     inputs,
     session::{builder::GraphOptimizationLevel, Session},
@@ -19,6 +19,12 @@ struct InferenceResponse {
     text: String,
     label: String,
     score: f32,
+}
+
+#[derive(Serialize)]
+struct HealthResponse {
+    status: String,
+    version: String,
 }
 
 struct AppState {
@@ -48,6 +54,7 @@ async fn main() {
 
     let app = Router::new()
         .route("/predict", post(predict))
+        .route("/health", get(health))
         .with_state(state);
 
     let addr = "0.0.0.0:3000";
@@ -55,6 +62,13 @@ async fn main() {
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
+}
+
+async fn health() -> Json<HealthResponse> {
+    Json(HealthResponse {
+        status: "ok".to_string(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+    })
 }
 
 async fn predict(
