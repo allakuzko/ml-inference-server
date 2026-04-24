@@ -6,7 +6,16 @@ A high-performance sentiment analysis REST API built with Rust + ONNX Runtime.
 - **Rust** + **axum** — async web server
 - **ort** — ONNX Runtime bindings
 - **tokenizers** — HuggingFace tokenizer
+- **anyhow** — error handling
 - **Model** — distilbert-base-uncased-finetuned-sst-2-english
+
+## Features
+- ✅ Single text inference — `POST /predict`
+- ✅ Batch inference — `POST /predict/batch`
+- ✅ Health check — `GET /health`
+- ✅ Inference time logging
+- ✅ Proper error handling
+- ✅ Rate limiting (10 req/sec per IP)
 
 ## Setup
 
@@ -33,14 +42,66 @@ export ORT_DYLIB_PATH=/usr/local/lib/libonnxruntime.so.1.24.2
 cargo run --release
 ```
 
-## Usage
-```bash
-curl -X POST http://localhost:3000/predict \
-  -H "Content-Type: application/json" \
-  -d '{"text": "I love this!"}'
+## API
+
+### `POST /predict`
+Single text sentiment analysis.
+
+**Request:**
+```json
+{"text": "I love this movie!"}
 ```
 
-## Response
+**Response:**
 ```json
-{"text":"I love this!","label":"POSITIVE","score":0.99}
+{
+  "text": "I love this movie!",
+  "label": "POSITIVE",
+  "score": 0.9998,
+  "inference_ms": 12
+}
+```
+
+### `POST /predict/batch`
+Batch sentiment analysis (max 32 texts).
+
+**Request:**
+```json
+{
+  "texts": [
+    "I love this!",
+    "This is terrible.",
+    "Pretty good actually."
+  ]
+}
+```
+
+**Response:**
+```json
+{
+  "results": [
+    {"text": "I love this!", "label": "POSITIVE", "score": 0.9998, "inference_ms": 12},
+    {"text": "This is terrible.", "label": "NEGATIVE", "score": 0.9995, "inference_ms": 10},
+    {"text": "Pretty good actually.", "label": "POSITIVE", "score": 0.9987, "inference_ms": 11}
+  ],
+  "total_ms": 33
+}
+```
+
+### `GET /health`
+Health check.
+
+**Response:**
+```json
+{"status": "ok", "version": "0.1.0"}
+```
+
+## Rate Limiting
+- Max **10 requests per second** per IP
+- Exceeding the limit returns `429 Too Many Requests`
+
+## Error Handling
+All errors return a JSON response:
+```json
+{"error": "error description", "code": 500}
 ```
